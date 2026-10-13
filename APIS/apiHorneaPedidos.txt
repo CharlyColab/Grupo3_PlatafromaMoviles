@@ -1,0 +1,222 @@
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+import boto3
+from botocore.exceptions import ClientError
+
+# Inicialización de DynamoDB
+dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = os.environ.get('TABLE_NAME', 'horneaPedidos')
+table = dynamodb.Table(TABLE_NAME)
+
+# Helper para serializar tipos de datos de DynamoDB (Decimal, etc.)
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return int(obj) if obj % 1 == 0 else float(obj)
+        return super(DecimalEncoder, self).default(obj)
+
+
+def get_timestamp():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+
+
+def build_response(status_code, body=None):
+    response = {
+        'statusCode': status_code,
+        'headers': {'Content-Type': 'application/json'}
+    }
+    if body is not None:
+        response['body'] = json.dumps(body, cls=DecimalEncoder)
+    return response
+
+
+# Validación mínima y conversión de datos enviados por Android
+# Los precios y totales son calculados por Android, no por esta API.
+def preparar_datos(data):
+    if not isinstance(data, dict):
+        raise ValueError('El cuerpo debe ser un objeto JSON')
+
+    campos_texto = ('clienteId', 'usuarioRegistro', 'fechaEntrega', 'horaEntrega')
+    for campo in campos_texto:
+        if not isinstance(data.get(campo), str) or not data[campo].strip():
+            raise ValueError(f'Campo obligatorio: {campo}')
+
+    detalles = data.get('detalleProductos')
+    if not isinstance(detalles, list) or not detalles:
+        raise ValueError('Debe incluir al menos un producto')
+
+    for campo in ('total', 'adelanto', 'saldo'):
+        if campo not in data:
+            raise ValueError(f'Campo obligatorio: {campo}')
+        data[campo] = Decimal(str(data[campo]))
+        if not data[campo].is_finite() or data[campo] < 0:
+            raise ValueError(f'Importe inválido: {campo}')
+
+    if data['adelanto'] > data['total']:
+        raise ValueError('El adelanto no puede superar el total')
+    if data['saldo'] != data['total'] - data['adelanto']:
+        raise ValueError('El saldo debe ser igual al total menos el adelanto')
+
+    for p in detalles:
+        if not isinstance(p, dict) or not isinstance(p.get('productoId'), str) or not p['productoId'].strip():
+            raise ValueError('productoId obligatorio en cada detalle')
+        cantidad = Decimal(str(p.get('cantidad')))
+        if not cantidad.is_finite() or cantidad <= 0 or cantidad != cantidad.to_integral_value():
+            raise ValueError('La cantidad debe ser un entero positivo')
+        p['cantidad'] = int(cantidad)
+        for campo in ('precioUnitario', 'subtotal'):
+            if campo not in p:
+                raise ValueError(f'Falta {campo} en detalleProductos')
+            p[campo] = Decimal(str(p[campo]))
+            if not p[campo].is_finite() or p[campo] < 0:
+                raise ValueError(f'Importe inválido en detalleProductos: {campo}')
+    return data
+
+
+def lambda_handler(event, context):
+    try:
+        # Extraer método y ruta desde HTTP API (v2 payload)
+        http_context = event.get('requestContext', {}).get('http', {})
+        http_method = http_context.get('method') or event.get('httpMethod')
+
+        # Extraer parámetros de ruta ({pedidoId})
+        path_parameters = event.get('pathParameters') or {}
+        pedido_id = path_parameters.get('pedidoId')
+
+        # 1. LISTAR (GET /pedidos)
+        if http_method == 'GET' and not pedido_id:
+            response = table.scan()
+            items = response.get('Items', [])
+
+            body = {
+                'success': True,
+                'data': {
+                    'items': items,
+                    'nextKey': response.get('LastEvaluatedKey', None)
+                },
+                'timestamp': get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 2. BUSCAR POR ID (GET /pedidos/{pedidoId})
+        elif http_method == 'GET' and pedido_id:
+            response = table.get_item(Key={'pedidoId': pedido_id})
+            item = response.get('Item')
+
+            if not item:
+                return build_response(404, {
+                    'success': False,
+                    'message': 'Pedido no encontrado',
+                    'timestamp': get_timestamp()
+                })
+
+            body = {
+                'success': True,
+                'data': item,
+                'timestamp': get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 3. INSERTAR (POST /pedidos)
+        elif http_method == 'POST' and not pedido_id:
+            data = json.loads(event.get('body') or '{}', parse_float=Decimal)
+            data = preparar_datos(data)
+            generated_id = 'PED-' + str(uuid.uuid4())
+
+            item = {
+                'pedidoId': generated_id,
+                'clienteId': data.get('clienteId'),
+                'usuarioRegistro': data.get('usuarioRegistro'),
+                'fechaEntrega': data.get('fechaEntrega'),
+                'horaEntrega': data.get('horaEntrega'),
+                'estado': data.get('estado', 'RECIBIDO'),
+                'total': data.get('total'),
+                'adelanto': data.get('adelanto'),
+                'saldo': data.get('saldo'),
+                'observacion': data.get('observacion', ''),
+                'fechaRegistro': get_timestamp(),
+                'detalleProductos': data.get('detalleProductos')
+            }
+
+            table.put_item(Item=item, ConditionExpression='attribute_not_exists(pedidoId)')
+
+            body = {
+                'success': True,
+                'data': item,
+                'timestamp': get_timestamp()
+            }
+            return build_response(201, body)
+
+        # 4. ACTUALIZAR (PUT /pedidos/{pedidoId})
+        # Permite modificar solo los campos enviados; por ejemplo: {"estado": "LISTO"}
+        elif http_method == 'PUT' and pedido_id:
+            data = json.loads(event.get('body') or '{}', parse_float=Decimal)
+            if not isinstance(data, dict) or not data:
+                raise ValueError('Debe enviar los campos a actualizar')
+
+            response = table.get_item(Key={'pedidoId': pedido_id})
+            anterior = response.get('Item')
+            if not anterior:
+                return build_response(404, {
+                    'success': False,
+                    'message': 'Pedido no encontrado',
+                    'timestamp': get_timestamp()
+                })
+
+            # Conservar pedidoId y fechaRegistro; no permitir modificarlos desde Android
+            campos_permitidos = {
+                'clienteId', 'usuarioRegistro', 'fechaEntrega', 'horaEntrega',
+                'estado', 'total', 'adelanto', 'saldo', 'observacion', 'detalleProductos'
+            }
+            if any(c not in campos_permitidos for c in data):
+                raise ValueError('Se enviaron campos no permitidos')
+
+            item = {**anterior, **data}
+            item = preparar_datos(item)
+            item['pedidoId'] = pedido_id
+            item['fechaRegistro'] = anterior['fechaRegistro']
+
+            table.put_item(Item=item, ConditionExpression='attribute_exists(pedidoId)')
+
+            body = {
+                'success': True,
+                'data': item,
+                'timestamp': get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 5. ELIMINAR (DELETE /pedidos/{pedidoId})
+        elif http_method == 'DELETE' and pedido_id:
+            table.delete_item(Key={'pedidoId': pedido_id})
+            return build_response(204)
+
+        else:
+            return build_response(400, {
+                'success': False,
+                'message': 'Ruta o método no soportado',
+                'timestamp': get_timestamp()
+            })
+
+    except (ValueError, TypeError, KeyError, InvalidOperation, json.JSONDecodeError) as e:
+        return build_response(400, {
+            'success': False,
+            'message': f'Datos inválidos: {e}',
+            'timestamp': get_timestamp()
+        })
+    except ClientError as e:
+        print('Error DynamoDB:', str(e))
+        return build_response(500, {
+            'success': False,
+            'message': 'Error al acceder a DynamoDB',
+            'timestamp': get_timestamp()
+        })
+    except Exception as e:
+        print('Error interno:', str(e))
+        return build_response(500, {
+            'success': False,
+            'message': 'Error interno del servidor',
+            'timestamp': get_timestamp()
+        })

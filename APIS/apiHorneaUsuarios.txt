@@ -1,0 +1,146 @@
+https://wbvqkea81e.execute-api.us-east-1.amazonaws.com/usuarios
+====================================================================================
+
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from decimal import Decimal
+import boto3
+from boto3.dynamodb.conditions import Key
+
+# Inicialización de DynamoDB
+dynamodb = boto3.resource('dynamodb')
+TABLE_NAME = os.environ.get('TABLE_NAME', 'horneaUsuarios')
+table = dynamodb.Table(TABLE_NAME)
+
+# Helper para serializar tipos de datos de DynamoDB (Decimal, etc.)
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return int(obj) if obj % 1 == 0 else float(obj)
+        return super(DecimalEncoder, self).default(obj)
+
+def get_timestamp():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+
+def build_response(status_code, body=None):
+    response = {
+        'statusCode': status_code,
+        'headers': {
+            'Content-Type': 'application/json'
+        }
+    }
+    if body is not None:
+        response['body'] = json.dumps(body, cls=DecimalEncoder)
+    return response
+
+def lambda_handler(event, context):
+    try:
+        # Extraer método y ruta desde HTTP API (v2 payload)
+        http_context = event.get('requestContext', {}).get('http', {})
+        http_method = http_context.get('method')
+        
+        # Extraer parámetros de ruta ({id})
+        path_parameters = event.get('pathParameters') or {}
+        user_id = path_parameters.get('usuarioId')
+        
+        # 1. LISTAR (GET /usuarios)
+        if http_method == 'GET' and not user_id:
+            response = table.scan()
+            items = response.get('Items', [])
+            
+            body = {
+                "success": True,
+                "data": {
+                    "items": items,
+                    "nextKey": response.get('LastEvaluatedKey', None)
+                },
+                "timestamp": get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 2. BUSCAR POR ID (GET /usuarios/{id})
+        elif http_method == 'GET' and user_id:
+            response = table.get_item(Key={'usuarioId': user_id})
+            item = response.get('Item')
+            
+            if not item:
+                return build_response(404, {
+                    "success": False,
+                    "message": "Usuario no encontrado",
+                    "timestamp": get_timestamp()
+                })
+                
+            body = {
+                "success": True,
+                "data": item,
+                "timestamp": get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 3. INSERTAR (POST /usuarios)
+        elif http_method == 'POST':
+            data = json.loads(event.get('body', '{}'))
+            generated_id = str(uuid.uuid4())
+            
+            item = {
+                "usuarioId": generated_id,
+                "nombre": data.get('nombre'),
+                "correo": data.get('correo'),
+                "passHash": data.get('passHass'),
+                "rol": data.get('rol'),
+                "estado": data.get('estado'),
+                "fechaCreacion": data.get('fechaCreacion')
+            }
+            
+            table.put_item(Item=item)
+            
+            body = {
+                "success": True,
+                "data": item,
+                "timestamp": get_timestamp()
+            }
+            return build_response(201, body)
+
+        # 4. ACTUALIZAR (PUT /usuarios/{id})
+        elif http_method == 'PUT' and user_id:
+            data = json.loads(event.get('body', '{}'))
+            
+            item = {
+                "usuarioId": user_id,
+                "nombre": data.get('nombre'),
+                "correo": data.get('correo'),
+                "passHash": data.get('passHass'),
+                "rol": data.get('rol'),
+                "estado": data.get('estado'),
+                "fechaCreacion": data.get('fechaCreacion')
+            }
+            
+            table.put_item(Item=item)
+            
+            body = {
+                "success": True,
+                "data": item,
+                "timestamp": get_timestamp()
+            }
+            return build_response(200, body)
+
+        # 5. ELIMINAR (DELETE /usuarios/{id})
+        elif http_method == 'DELETE' and user_id:
+            table.delete_item(Key={'usuarioId': user_id})
+            return build_response(204)
+
+        else:
+            return build_response(400, {
+                "success": False,
+                "message": "Ruta o método no soportado",
+                "timestamp": get_timestamp()
+            })
+
+    except Exception as e:
+        return build_response(500, {
+            "success": False,
+            "error": str(e),
+            "timestamp": get_timestamp()
+        })
